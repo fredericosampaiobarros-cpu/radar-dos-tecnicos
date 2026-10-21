@@ -1,0 +1,68 @@
+name: Auditar cobertura das competições
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verificar jogos e técnicos disponíveis
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: |
+          python - <<'PY'
+          """Check real account access before recommending any paid data plan.
+          Writes provider metadata and a small sample of fixture/coach availability.
+          """
+          import datetime,json,pathlib,os,time,urllib.request,urllib.parse
+          TARGETS=['Serie A','Copa Do Brasil','CONMEBOL Libertadores','CONMEBOL Sudamericana','Paulista - A1','Carioca - 1','Mineiro - 1','Gaúcho - 1']
+          OUT=pathlib.Path('coverage-audit');OUT.mkdir(exist_ok=True)
+          key=os.environ.get('API_FOOTBALL_KEY');calls=0
+          if not key:raise SystemExit('Configure the GitHub Actions secret API_FOOTBALL_KEY before running this audit.')
+          def get(path,params):
+           global calls
+           if calls>=60:raise RuntimeError('Audit request limit reached')
+           if calls:time.sleep(6.2)
+           req=urllib.request.Request('https://v3.football.api-sports.io/'+path+'?'+urllib.parse.urlencode(params),headers={'x-apisports-key':key})
+           calls+=1
+           body=json.load(urllib.request.urlopen(req,timeout=30))
+           if body.get('errors'):return {'response':[],'error_categories':list(body['errors']) if isinstance(body['errors'],dict) else ['provider_error']}
+           return body
+          leagues=[];errors=[]
+          for country in ['Brazil','World']:
+           body=get('leagues',{'country':country});leagues.extend(body.get('response',[]))
+           if body.get('error_categories'):errors.append({'country':country,'categories':body['error_categories']})
+          (OUT/'provider-coverage.json').write_text(json.dumps(leagues,ensure_ascii=False,indent=2))
+          probes=[]
+          for name in TARGETS:
+           candidates=[x for x in leagues if x['league']['name'].casefold()==name.casefold()]
+           if not candidates:
+            probes.append({'competition':name,'status':'name_not_found_requires_mapping'});continue
+           for league in candidates:
+            for year in [2016,2020,2026]:
+             seasons=[x for x in league['seasons'] if x['year']==year]
+             if not seasons:
+              probes.append({'competition':name,'year':year,'status':'season_not_advertised'});continue
+             body=get('fixtures',{'league':league['league']['id'],'season':year,'status':'FT-AET-PEN','timezone':'America/Sao_Paulo'})
+             fixtures=body.get('response',[])
+             probe={'competition':name,'league_id':league['league']['id'],'year':year,'fixtures':len(fixtures),'lineups_advertised':seasons[0]['coverage']['fixtures'].get('lineups'),'errors':body.get('error_categories',[]),'status':'sample_only_not_complete_audit'}
+             if fixtures:
+              fixture=sorted(fixtures,key=lambda f:f['fixture']['date'],reverse=True)[0];fid=fixture['fixture']['id'];lineup=get('fixtures/lineups',{'fixture':fid})
+              rows=lineup.get('response',[]);teams={r['team']['id'] for r in rows if r.get('coach',{}).get('id') and r.get('coach',{}).get('name')}
+              probe['sample_fixture_id']=fid;probe['sample_coach_sides']=len(teams);probe['lineup_errors']=lineup.get('error_categories',[])
+              (OUT/f'sample-{fid}.json').write_text(json.dumps({'fixture':fixture,'lineups':rows},ensure_ascii=False,indent=2))
+             probes.append(probe)
+          report={'retrieved_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'competitions_returned':len(leagues),'requests':calls,'probes':probes,'errors':errors,'all_competitions_ready':False,'notes':['Advertised coverage is not a completeness guarantee.','One sampled lineup does not establish coach coverage for all games.','No subscription was purchased and no site was deployed.']}
+          (OUT/'audit.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+          print(json.dumps({'requests':calls,'competitions_returned':len(leagues),'probes':len(probes),'artifact':'coverage-audit'}))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-audit
+          path: coverage-audit/
+          if-no-files-found: error
